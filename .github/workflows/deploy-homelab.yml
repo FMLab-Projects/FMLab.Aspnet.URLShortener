@@ -1,0 +1,220 @@
+# Deploys the API to the homelab instead of AWS EC2 (see deploy.yml.disabled).
+#
+# Required self-hosted runner: labeled [self-hosted, linux, homelab, fmlab, x64],
+# with Docker available and connectivity to the shared `homelab-network` Docker
+# network (Postgres, Redis and Traefik already run there — see docker/docker-compose.homelab.yml).
+#
+# Required on the runner host:
+#   A secrets file at the path named by the HOMELAB_ENV_FILE repository variable
+#   (default: /home/fagner/homelab/applications/url-shortener/.env) — copy
+#   docker/.env.homelab.example there and fill it in.
+
+name: Deploy Homelab
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-homelab
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Restore dependencies
+        run: dotnet restore src/FMLab.Aspnet.URLShortener.sln
+
+      - name: Run tests
+        run: dotnet test src/FMLab.Aspnet.URLShortener.sln --no-restore --verbosity normal
+
+  release:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+
+    permissions:
+      contents: write
+      packages: write
+
+    outputs:
+      version: ${{ steps.tag.outputs.new_version }}
+      tag: ${{ steps.tag.outputs.new_tag }}
+      owner: ${{ steps.image.outputs.owner }}
+
+    steps:
+      - name: Checkout (full history for tag calculation)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next version tag
+        id: tag
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: patch
+          release_branches: main
+          tag_prefix: v
+
+      - name: Resolve image namespace
+        if: steps.tag.outputs.new_tag != ''
+        id: image
+        run: echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.tag.outputs.new_tag != ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: steps.tag.outputs.new_tag != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push API image
+        if: steps.tag.outputs.new_tag != ''
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ghcr.io/${{ steps.image.outputs.owner }}/fmlab-url-shortener:${{ steps.tag.outputs.new_version }}
+            ghcr.io/${{ steps.image.outputs.owner }}/fmlab-url-shortener:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.tag.outputs.new_version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Create GitHub Release
+        if: steps.tag.outputs.new_tag != ''
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.new_tag }}
+          name: ${{ steps.tag.outputs.new_tag }}
+          body: |
+            ${{ steps.tag.outputs.changelog }}
+
+            ---
+            **Imagem**: `ghcr.io/${{ steps.image.outputs.owner }}/fmlab-url-shortener:${{ steps.tag.outputs.new_version }}`
+
+  deploy:
+    name: Deploy homelab
+    needs: release
+    if: needs.release.outputs.version != ''
+
+    runs-on:
+      - self-hosted
+      - linux
+      - homelab
+      - fmlab
+      - x64
+
+    permissions:
+      contents: read
+      packages: read
+
+    # There is one runner in the house: a hung deploy must not hold the next one.
+    timeout-minutes: 20
+
+    env:
+      COMPOSE_FILE: docker/docker-compose.homelab.yml
+      ENV_FILE: ${{ vars.HOMELAB_ENV_FILE || '/home/fagner/homelab/applications/url-shortener/.env' }}
+      IMAGE_OWNER: ${{ needs.release.outputs.owner }}
+      IMAGE_TAG: ${{ needs.release.outputs.version }}
+
+    steps:
+      - name: Checkout the released commit
+        uses: actions/checkout@v4
+
+      - name: Verify secrets file exists
+        run: |
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "::error::Secrets file not found at $ENV_FILE — copy docker/.env.homelab.example there and fill it in."
+            exit 1
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Runs against the shared Postgres over homelab-network — no local DB
+      # container in docker-compose.homelab.yml. Scripts are not guaranteed
+      # idempotent, same as the previous EC2 workflow's migrate job.
+      - name: Run DB migrations
+        run: |
+          set -a
+          . "$ENV_FILE"
+          set +a
+
+          docker run --rm \
+            --network "${HOMELAB_NETWORK:-homelab-network}" \
+            -e PGHOST="$DB_SERVER" -e PGPORT="$DB_PORT" \
+            -e PGUSER="$DB_USER" -e PGPASSWORD="$DB_PASSWORD" -e PGDATABASE="$DB_NAME" \
+            -v "${{ github.workspace }}/infra/db:/sql:ro" \
+            postgres:16-alpine \
+            sh -c 'for f in $(ls /sql/*.sql | sort); do echo "Running $f..."; psql -f "$f" || exit 1; done'
+
+      - name: Pull the released API image
+        run: docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" pull api
+
+      # The API's healthcheck (Dockerfile) hits /api/health, which also checks
+      # Postgres and Redis connectivity; `--wait` blocks until it reports healthy.
+      - name: Start the stack
+        run: |
+          docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" \
+            up -d --remove-orphans --wait --wait-timeout 240
+
+      - name: Verify the stack is healthy
+        run: |
+          cid="$(docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps -q api)"
+          if [ -z "$cid" ]; then
+            echo "::error::'api' has no container — the stack did not start."
+            exit 1
+          fi
+          status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' "$cid")"
+          echo "api: $status"
+          [ "$status" = "healthy" ]
+
+      - name: Dump stack state on failure
+        if: failure()
+        run: |
+          docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" ps || true
+          docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" logs --tail=200 || true
+
+      # Untagged leftovers only, and only older than a day: the image this deploy
+      # replaced stays on disk for a while, which is what a manual rollback
+      # (IMAGE_TAG=<previous> docker compose up -d) needs to be fast.
+      - name: Prune dangling images
+        if: always()
+        run: docker image prune -f --filter "until=24h"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deploy homelab"
+            echo ""
+            echo "- Version: \`${IMAGE_TAG}\`"
+            echo "- Image: \`ghcr.io/${IMAGE_OWNER}/fmlab-url-shortener\`"
+            echo "- Commit: \`${GITHUB_SHA}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

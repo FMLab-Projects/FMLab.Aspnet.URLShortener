@@ -1,3 +1,9 @@
+# DISABLED — superseded by deploy-homelab.yml. Deploys now target the homelab
+# instead of AWS EC2. Renamed off the .yml extension so GitHub Actions no
+# longer picks this file up from .github/workflows/. Kept for reference/rollback;
+# delete once the homelab deploy has proven itself, or rename back to .yml to
+# reactivate.
+
 name: Build and Deploy
 
 on:
