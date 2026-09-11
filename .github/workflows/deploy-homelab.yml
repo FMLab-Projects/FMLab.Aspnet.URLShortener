@@ -93,6 +93,7 @@ jobs:
           file: docker/Dockerfile
           push: true
           platforms: linux/amd64
+          build-args: APP_VERSION=${{ steps.tag.outputs.new_version }}
           tags: |
             ghcr.io/${{ steps.image.outputs.owner }}/fmlab-url-shortener:${{ steps.tag.outputs.new_version }}
             ghcr.io/${{ steps.image.outputs.owner }}/fmlab-url-shortener:latest
