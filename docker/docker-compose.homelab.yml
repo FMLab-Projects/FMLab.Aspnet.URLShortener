@@ -13,6 +13,11 @@ services:
     environment:
       ASPNETCORE_ENVIRONMENT: Production
       ASPNETCORE_HTTP_PORTS: 8080
+      # appsettings.json pins AllowedHosts to the old EC2 domain (*.fagnermarinho.dev).
+      # Traefik already only forwards requests matching APP_HOSTNAME, and the
+      # container's own HEALTHCHECK hits 127.0.0.1 — neither matches that pattern,
+      # so host filtering is redundant here and gets disabled.
+      AllowedHosts: "*"
       ApiKey: ${API_KEY}
       Database:Server: ${DB_SERVER}
       Database:Port: ${DB_PORT}
