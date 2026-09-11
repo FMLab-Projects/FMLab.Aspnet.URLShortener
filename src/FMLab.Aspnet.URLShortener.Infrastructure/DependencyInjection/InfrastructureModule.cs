@@ -35,7 +35,13 @@ public static class InfrastructureModule
         }
         .ConnectionString;
 
-        var redisConnection = ConnectionMultiplexer.Connect($"{config["Redis:Host"]}:{config["Redis:Port"]}");
+        var redisOptions = new ConfigurationOptions
+        {
+            EndPoints = { { config["Redis:Host"]!, int.Parse(config["Redis:Port"]!) } },
+            Password = config["Redis:Password"]
+        };
+
+        var redisConnection = ConnectionMultiplexer.Connect(redisOptions);
 
         services.AddDbContext<ApplicationDbContext>(options =>
         {

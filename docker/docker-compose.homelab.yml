@@ -21,6 +21,7 @@ services:
       Database:Password: ${DB_PASSWORD}
       Redis:Host: ${REDIS_HOST}
       Redis:Port: ${REDIS_PORT}
+      Redis:Password: ${REDIS_PASSWORD}
     networks:
       homelab-network:
         aliases:
